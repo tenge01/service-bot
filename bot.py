@@ -8,15 +8,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-import sqlite3
 import openpyxl
 from docx import Document
 from docx.shared import Pt
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import re
 
 # ─── Настройки ───────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "1048969972"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -33,13 +35,16 @@ class Form(StatesGroup):
     description = State()
     confirm     = State()
 
-# ─── База данных ─────────────────────────────────────────────
+# ─── База данных PostgreSQL ───────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    con = sqlite3.connect("data/tickets.db")
+    con = get_conn()
     cur = con.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tickets (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             ticket_num  TEXT,
             phone       TEXT,
             city        TEXT,
@@ -50,64 +55,66 @@ def init_db():
             service_contact TEXT,
             status      TEXT DEFAULT 'новая',
             created_at  TEXT,
-            tg_user_id  INTEGER
+            tg_user_id  BIGINT
         )
     """)
     con.commit()
+    cur.close()
     con.close()
 
 def save_ticket(data: dict) -> int:
-    con = sqlite3.connect("data/tickets.db")
+    con = get_conn()
     cur = con.cursor()
     cur.execute("""
         INSERT INTO tickets
         (ticket_num, phone, city, school, serial, description, service, service_contact, created_at, tg_user_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
     """, (
         data["ticket_num"], data["phone"], data["city"], data["school"],
         data["serial"], data["description"], data["service"],
         data["service_contact"], data["created_at"], data["tg_user_id"]
     ))
+    row_id = cur.fetchone()[0]
     con.commit()
-    row_id = cur.lastrowid
+    cur.close()
     con.close()
     return row_id
 
 def get_all_tickets():
-    con = sqlite3.connect("data/tickets.db")
+    con = get_conn()
     cur = con.cursor()
-    cur.execute("SELECT * FROM tickets ORDER BY id DESC")
+    cur.execute("SELECT * FROM tickets ORDER BY id DESC LIMIT 10")
     rows = cur.fetchall()
+    cur.close()
     con.close()
     return rows
 
 def update_status(ticket_num: str, status: str):
-    con = sqlite3.connect("data/tickets.db")
+    con = get_conn()
     cur = con.cursor()
-    cur.execute("UPDATE tickets SET status=? WHERE ticket_num=?", (status, ticket_num))
+    cur.execute("UPDATE tickets SET status=%s WHERE ticket_num=%s", (status, ticket_num))
     con.commit()
+    cur.close()
     con.close()
+
+def gen_ticket_num() -> str:
+    now = datetime.now()
+    con = get_conn()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM tickets")
+    count = cur.fetchone()[0] + 1
+    cur.close()
+    con.close()
+    return f"ZV-{now.strftime('%Y%m%d')}-{count:04d}"
 
 # ─── Маршрутизация по Excel ───────────────────────────────────
 def find_service(city: str, serial: str) -> dict:
-    """
-    Ищет сервисный центр в файле data/services.xlsx
-    Колонки: Город | Тип техники | Бренд | Сервис | Контакт
-    Если файл не найден — возвращает заглушку.
-    """
     path = "data/services.xlsx"
     if not os.path.exists(path):
-        return {
-            "service": "Сервисный центр (таблица не загружена)",
-            "contact": "Не указан"
-        }
-
+        return {"service": "Сервисный центр (таблица не загружена)", "contact": "Не указан"}
     wb = openpyxl.load_workbook(path)
     ws = wb.active
-
     city_lower = city.strip().lower()
-
-    # Сначала ищем по городу (минимум)
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row[0]:
             continue
@@ -117,49 +124,28 @@ def find_service(city: str, serial: str) -> dict:
                 "service": str(row[3]) if row[3] else "Не указан",
                 "contact": str(row[4]) if row[4] else "Не указан"
             }
+    return {"service": f"Сервис для города {city} не найден", "contact": "Уточните вручную"}
 
-    return {
-        "service": f"Сервис для города {city} не найден",
-        "contact": "Уточните вручную"
-    }
-
-# ─── Генерация номера заявки ──────────────────────────────────
-def gen_ticket_num() -> str:
-    now = datetime.now()
-    con = sqlite3.connect("data/tickets.db")
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM tickets")
-    count = cur.fetchone()[0] + 1
-    con.close()
-    return f"ZV-{now.strftime('%Y%m%d')}-{count:04d}"
-
-# ─── Генерация талона (DOCX) ──────────────────────────────────
+# ─── Генерация талона ─────────────────────────────────────────
 def generate_tallon(data: dict) -> str:
     doc = Document()
-
-    # Заголовок
     title = doc.add_heading("ТАЛОН НА РЕМОНТ ОБОРУДОВАНИЯ", 0)
-    title.alignment = 1  # center
-
+    title.alignment = 1
     doc.add_paragraph("")
-
-    # Данные
     fields = [
-        ("Номер заявки",        data["ticket_num"]),
-        ("Дата",                data["created_at"][:10]),
-        ("Телефон заявителя",   data["phone"]),
-        ("Город",               data["city"]),
-        ("Школа",               data["school"]),
-        ("Серийный номер",      data["serial"]),
+        ("Номер заявки",           data["ticket_num"]),
+        ("Дата",                   data["created_at"][:10]),
+        ("Телефон заявителя",      data["phone"]),
+        ("Город",                  data["city"]),
+        ("Школа",                  data["school"]),
+        ("Серийный номер",         data["serial"]),
         ("Описание неисправности", data["description"]),
-        ("Сервисный центр",     data["service"]),
-        ("Контакт сервиса",     data["service_contact"]),
-        ("Статус",              "Новая заявка"),
+        ("Сервисный центр",        data["service"]),
+        ("Контакт сервиса",        data["service_contact"]),
+        ("Статус",                 "Новая заявка"),
     ]
-
     table = doc.add_table(rows=len(fields), cols=2)
     table.style = "Table Grid"
-
     for i, (label, value) in enumerate(fields):
         row = table.rows[i]
         row.cells[0].text = label
@@ -168,16 +154,15 @@ def generate_tallon(data: dict) -> str:
             for para in cell.paragraphs:
                 for run in para.runs:
                     run.font.size = Pt(11)
-
     doc.add_paragraph("")
     doc.add_paragraph("Подпись представителя школы: ___________________")
     doc.add_paragraph("Подпись сервисного центра:  ___________________")
-
-    path = f"data/tallon_{data['ticket_num']}.docx"
+    os.makedirs("/tmp/tallons", exist_ok=True)
+    path = f"/tmp/tallons/tallon_{data['ticket_num']}.docx"
     doc.save(path)
     return path
 
-# ─── Хэндлеры бота ───────────────────────────────────────────
+# ─── Хэндлеры ────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -185,16 +170,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await message.answer(
         "👋 Здравствуйте!\n\n"
         "Это сервис подачи заявок на ремонт оборудования.\n\n"
-        "Давайте начнём. Укажите ваш номер телефона:",
+        "Укажите ваш номер телефона:",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(Form.phone)
 
-
 @dp.message(Form.phone)
 async def got_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
-    # Простая проверка что похоже на номер
     if len(phone) < 7:
         await message.answer("Пожалуйста, введите корректный номер телефона:")
         return
@@ -202,13 +185,11 @@ async def got_phone(message: types.Message, state: FSMContext):
     await message.answer("Из какого вы города?")
     await state.set_state(Form.city)
 
-
 @dp.message(Form.city)
 async def got_city(message: types.Message, state: FSMContext):
     await state.update_data(city=message.text.strip())
     await message.answer("Укажите название вашей школы:")
     await state.set_state(Form.school)
-
 
 @dp.message(Form.school)
 async def got_school(message: types.Message, state: FSMContext):
@@ -219,28 +200,19 @@ async def got_school(message: types.Message, state: FSMContext):
     )
     await state.set_state(Form.serial)
 
-
 @dp.message(Form.serial)
 async def got_serial(message: types.Message, state: FSMContext):
     await state.update_data(serial=message.text.strip())
     await message.answer("Опишите неисправность. Что случилось с оборудованием?")
     await state.set_state(Form.description)
 
-
 @dp.message(Form.description)
 async def got_description(message: types.Message, state: FSMContext):
     await state.update_data(description=message.text.strip())
     data = await state.get_data()
-
-    # Ищем сервис
     service_info = find_service(data["city"], data["serial"])
+    await state.update_data(service=service_info["service"], service_contact=service_info["contact"])
 
-    await state.update_data(
-        service=service_info["service"],
-        service_contact=service_info["contact"]
-    )
-
-    # Показываем сводку для подтверждения
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Всё верно, отправить")],
@@ -248,7 +220,6 @@ async def got_description(message: types.Message, state: FSMContext):
         ],
         resize_keyboard=True
     )
-
     await message.answer(
         f"📋 *Проверьте данные заявки:*\n\n"
         f"📞 Телефон: {data['phone']}\n"
@@ -264,24 +235,17 @@ async def got_description(message: types.Message, state: FSMContext):
     )
     await state.set_state(Form.confirm)
 
-
 @dp.message(Form.confirm, F.text == "✅ Всё верно, отправить")
 async def confirmed(message: types.Message, state: FSMContext):
     data = await state.get_data()
-
-    ticket_num  = gen_ticket_num()
-    created_at  = datetime.now().strftime("%Y-%m-%d %H:%M")
-
+    ticket_num = gen_ticket_num()
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     full_data = {**data, "ticket_num": ticket_num, "created_at": created_at,
                  "tg_user_id": message.from_user.id}
 
-    # Сохраняем в БД
     save_ticket(full_data)
-
-    # Генерируем талон
     tallon_path = generate_tallon(full_data)
 
-    # Отвечаем школе
     await message.answer(
         f"✅ *Заявка принята!*\n\n"
         f"Номер вашей заявки: *{ticket_num}*\n\n"
@@ -291,7 +255,6 @@ async def confirmed(message: types.Message, state: FSMContext):
         reply_markup=ReplyKeyboardRemove()
     )
 
-    # Уведомляем админа
     admin_text = (
         f"🆕 *Новая заявка {ticket_num}*\n\n"
         f"📞 {full_data['phone']}\n"
@@ -310,22 +273,15 @@ async def confirmed(message: types.Message, state: FSMContext):
             caption=f"Талон — {ticket_num}"
         )
     except Exception as e:
-        log.error(f"Не удалось отправить уведомление админу: {e}")
+        log.error(f"Ошибка отправки админу: {e}")
 
     await state.clear()
-
 
 @dp.message(Form.confirm, F.text == "❌ Начать заново")
 async def restart(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "Хорошо, начнём сначала.\n\nУкажите ваш номер телефона:",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await message.answer("Хорошо, начнём сначала.\n\nУкажите ваш номер телефона:", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Form.phone)
-
-
-# ─── Команды для админа ───────────────────────────────────────
 
 @dp.message(F.text == "/tickets")
 async def admin_tickets(message: types.Message):
@@ -336,10 +292,9 @@ async def admin_tickets(message: types.Message):
         await message.answer("Заявок пока нет.")
         return
     text = "📋 *Последние заявки:*\n\n"
-    for r in rows[:10]:
+    for r in rows:
         text += f"*{r[1]}* | {r[4]} | {r[5]} | {r[9]}\n"
     await message.answer(text, parse_mode="Markdown")
-
 
 @dp.message(F.text.startswith("/status "))
 async def admin_set_status(message: types.Message):
@@ -353,9 +308,7 @@ async def admin_set_status(message: types.Message):
     update_status(ticket_num, status)
     await message.answer(f"✅ Статус заявки {ticket_num} обновлён: {status}")
 
-
 # ─── Запуск ───────────────────────────────────────────────────
-
 async def main():
     init_db()
     log.info("Бот запущен")
