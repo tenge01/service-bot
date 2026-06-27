@@ -291,12 +291,6 @@ async def confirmed(message: types.Message, state: FSMContext):
         reply_markup=ReplyKeyboardRemove()
     )
 
-    # Отправляем талон школе
-    await message.answer_document(
-        types.FSInputFile(tallon_path),
-        caption=f"Ваш талон на ремонт — заявка {ticket_num}"
-    )
-
     # Уведомляем админа
     admin_text = (
         f"🆕 *Новая заявка {ticket_num}*\n\n"
