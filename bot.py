@@ -19,6 +19,7 @@ import re
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+DESIGNER_USERNAME = "mikasssss"  # Telegram username дизайнера
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -274,6 +275,30 @@ async def confirmed(message: types.Message, state: FSMContext):
         )
     except Exception as e:
         log.error(f"Ошибка отправки админу: {e}")
+
+    # Уведомляем дизайнера
+    designer_text = (
+        f"🖨 *Новая заявка — нужен талон*
+
+"
+        f"🔢 Серийный номер: `{full_data['serial']}`
+"
+        f"🏫 Школа: {full_data['school']}
+"
+        f"🏙 Город: {full_data['city']}
+"
+        f"🔧 Неисправность: {full_data['description']}
+"
+        f"📋 Заявка: {ticket_num}"
+    )
+    try:
+        await bot.send_message(
+            f"@{DESIGNER_USERNAME}",
+            designer_text,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.error(f"Не удалось написать дизайнеру: {e}")
 
     await state.clear()
 
